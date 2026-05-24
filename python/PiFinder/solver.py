@@ -25,7 +25,6 @@ from PiFinder.sqm import SQM as SQMCalculator
 from PiFinder.state import SQM as SQMState
 
 sys.path.append(str(utils.tetra3_dir))
-sys.path.append(str(utils.tetra3_dir / "tetra3"))
 import tetra3
 from tetra3 import cedar_detect_client
 
@@ -124,7 +123,13 @@ def update_sqm(
             k: v
             for k, v in details.items()
             if k
-            not in ("star_centroids", "star_mags", "star_fluxes", "star_local_backgrounds", "star_mzeros")
+            not in (
+                "star_centroids",
+                "star_mags",
+                "star_fluxes",
+                "star_local_backgrounds",
+                "star_mzeros",
+            )
         }
         shared_state.set_sqm_details(filtered_details)
 
@@ -176,7 +181,9 @@ class PFCedarDetectClient(cedar_detect_client.CedarDetectClient):
             )
         return self._stub
 
-    def extract_centroids(self, image, sigma, max_size, use_binned, detect_hot_pixels=True):
+    def extract_centroids(
+        self, image, sigma, max_size, use_binned, detect_hot_pixels=True
+    ):
         """Override to raise CedarConnectionError on gRPC failure instead of returning empty list."""
         import numpy as np
         from tetra3 import cedar_detect_pb2
@@ -188,10 +195,14 @@ class PFCedarDetectClient(cedar_detect_client.CedarDetectClient):
         # Use shared memory path (same machine)
         if self._use_shmem:
             self._alloc_shmem(size=width * height)
-            shimg = np.ndarray(np_image.shape, dtype=np_image.dtype, buffer=self._shmem.buf)
+            shimg = np.ndarray(
+                np_image.shape, dtype=np_image.dtype, buffer=self._shmem.buf
+            )
             shimg[:] = np_image[:]
 
-            im = cedar_detect_pb2.Image(width=width, height=height, shmem_name=self._shmem.name)
+            im = cedar_detect_pb2.Image(
+                width=width, height=height, shmem_name=self._shmem.name
+            )
             req = cedar_detect_pb2.CentroidsRequest(
                 input_image=im,
                 sigma=sigma,
@@ -208,10 +219,14 @@ class PFCedarDetectClient(cedar_detect_client.CedarDetectClient):
                     self._del_shmem()
                     self._use_shmem = False
                 else:
-                    raise CedarConnectionError(f"Cedar gRPC failed: {err.details()}") from err
+                    raise CedarConnectionError(
+                        f"Cedar gRPC failed: {err.details()}"
+                    ) from err
 
         if not self._use_shmem:
-            im = cedar_detect_pb2.Image(width=width, height=height, image_data=np_image.tobytes())
+            im = cedar_detect_pb2.Image(
+                width=width, height=height, image_data=np_image.tobytes()
+            )
             req = cedar_detect_pb2.CentroidsRequest(
                 input_image=im,
                 sigma=sigma,
@@ -222,7 +237,9 @@ class PFCedarDetectClient(cedar_detect_client.CedarDetectClient):
             try:
                 centroids_result = self._get_stub().ExtractCentroids(req)
             except grpc.RpcError as err:
-                raise CedarConnectionError(f"Cedar gRPC failed: {err.details()}") from err
+                raise CedarConnectionError(
+                    f"Cedar gRPC failed: {err.details()}"
+                ) from err
 
         tetra_centroids = []
         if centroids_result is not None:
@@ -244,6 +261,7 @@ def solver(
     align_result_queue,
     camera_command_queue,
     is_debug=False,
+    max_imu_ang_during_exposure=1.0,  # Max allowed turn during exp [degrees]
 ):
     MultiprocLogging.configurer(log_queue)
     logger.debug("Starting Solver")
@@ -252,34 +270,9 @@ def solver(
     )
     align_ra = 0
     align_dec = 0
+    # Dict of RA, Dec, etc. initialized to None:
+    solved = get_initialized_solved_dict()
     solution = {}
-    solved = {
-        # RA, Dec, Roll solved at the center of the camera FoV
-        # update by integrator
-        "camera_center": {
-            "RA": None,
-            "Dec": None,
-            "Roll": None,
-            "Alt": None,
-            "Az": None,
-        },
-        # RA, Dec, Roll from the camera, not
-        # affected by IMU in integrator
-        "camera_solve": {
-            "RA": None,
-            "Dec": None,
-            "Roll": None,
-        },
-        # RA, Dec, Roll at the target pixel
-        "RA": None,
-        "Dec": None,
-        "Roll": None,
-        "imu_pos": None,
-        "solve_time": None,
-        "cam_solve_time": 0,
-        "last_solve_attempt": 0,  # Timestamp of last solve attempt - tracks exposure_end of last processed image
-        "last_solve_success": None,  # Timestamp of last successful solve
-    }
 
     centroids = []
     log_no_stars_found = True
@@ -344,14 +337,8 @@ def solver(
                 is_new_image = (
                     last_image_metadata["exposure_end"] > solved["last_solve_attempt"]
                 )
-                is_stationary = last_image_metadata["imu_delta"] < 1
 
-                if is_new_image and not is_stationary:
-                    logger.debug(
-                        f"Skipping image - IMU delta {last_image_metadata['imu_delta']:.2f}° >= 1° (moving)"
-                    )
-
-                if is_new_image and is_stationary:
+                if is_new_image:
                     try:
                         img = camera_image.copy()
                         img = img.convert(mode="L")
@@ -371,7 +358,9 @@ def solver(
                                     np_image, sigma=8, max_size=10, use_binned=True
                                 )
                             except CedarConnectionError as e:
-                                logger.warning(f"Cedar connection failed: {e}, falling back to tetra3")
+                                logger.warning(
+                                    f"Cedar connection failed: {e}, falling back to tetra3"
+                                )
                                 centroids = tetra3.get_centroids_from_image(np_image)
                         else:
                             # Cedar not available, use tetra3
@@ -462,19 +451,21 @@ def solver(
                             solved["camera_center"]["Dec"] = solved["Dec"]
                             solved["camera_center"]["Roll"] = solved["Roll"]
 
-                            # RA, Dec, Roll at the center of the camera's not imu:
+                            # RA, Dec, Roll at the camera center from plate-solve (no IMU compensation)
                             solved["camera_solve"]["RA"] = solved["RA"]
                             solved["camera_solve"]["Dec"] = solved["Dec"]
                             solved["camera_solve"]["Roll"] = solved["Roll"]
+
                             # RA, Dec, Roll at the target pixel:
+                            # Replace the camera center RA/Dec with the RA/Dec for the target pixel
                             solved["RA"] = solved["RA_target"]
                             solved["Dec"] = solved["Dec_target"]
-                            if last_image_metadata["imu"]:
-                                solved["imu_pos"] = last_image_metadata["imu"]["pos"]
+
+                            if last_image_metadata.get("imu"):
                                 solved["imu_quat"] = last_image_metadata["imu"]["quat"]
                             else:
-                                solved["imu_pos"] = None
                                 solved["imu_quat"] = None
+
                             solved["solve_time"] = time.time()
                             solved["cam_solve_time"] = solved["solve_time"]
                             # Mark successful solve - use same timestamp as last_solve_attempt for comparison
@@ -540,7 +531,7 @@ def solver(
                 logger.error(
                     f"Active threads: {[t.name for t in threading.enumerate()]}"
                 )
-            except Exception as e:
+            except Exception:
                 pass  # Don't let diagnostic logging fail
 
 
