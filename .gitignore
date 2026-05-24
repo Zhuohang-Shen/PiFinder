@@ -162,3 +162,8 @@ python/tetra3
 # users GPS data
 test_ubx
 test_ubx/*
+
+# nix / direnv (kept out of migration; reintroduce after migration to nixos)
+.direnv/
+.envrc
+shell.nix
